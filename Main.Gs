@@ -100,8 +100,18 @@ const CONFIG = {
   ],
 
   // --- CONTROL DEL SCAN ---
-  SEARCH_QUERY: 'in:inbox is:unread newer_than:2d',
+  // Excluimos labels propias para que threads ya procesados/marcados no
+  // vuelvan a aparecer en la query (capa extra anti-bucle, además del
+  // tracking por Message-ID).
+  SEARCH_QUERY: 'in:inbox is:unread newer_than:2d ' +
+    '-label:BOT/Laboral-Procesado -label:BOT/Laboral-Revisar ' +
+    '-label:BOT/DRY-Laboral -label:BOT/DRY-Ambiguo',
   MAX_THREADS_PER_RUN: 50,
+
+  // Cuántas filas finales leer del control sheet para chequear duplicados.
+  // Buffer holgado: 2000 filas cubren semanas de actividad y la query Gmail
+  // ya filtra por newer_than:2d. Evita cargar toda la hoja en memoria.
+  CONTROL_SHEET_LOOKBACK: 2000,
 
   // --- ETIQUETAS DE GMAIL ---
   // Producción: se aplican cuando DRY_RUN = false
@@ -121,6 +131,15 @@ const CONFIG = {
 // ============================================================================
 
 function procesarCorreosLaborales() {
+  // Lock para evitar que dos triggers se solapen y procesen el mismo mensaje
+  // (puede pasar si una corrida tarda más de 15 min). Si no logramos el lock
+  // en 30s, abortamos: la próxima corrida lo tomará.
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    console.log('[INFO] Otra corrida en curso. Abortando.');
+    return;
+  }
+
   const startTime = new Date();
   logBot('INFO', 'Inicio de corrida', `DRY_RUN=${CONFIG.DRY_RUN}`);
 
@@ -128,6 +147,7 @@ function procesarCorreosLaborales() {
   // los aliases del usuario, detenemos la corrida. Prefiero que nada salga
   // a que salga con una identidad incorrecta.
   if (!validarAliasConfigurado()) {
+    lock.releaseLock();
     return;
   }
 
@@ -142,6 +162,10 @@ function procesarCorreosLaborales() {
     for (const thread of threads) {
       const messages = thread.getMessages();
       for (const msg of messages) {
+        // La query devuelve threads con AL MENOS un mensaje unread, pero
+        // thread.getMessages() trae todos los mensajes del hilo. Saltamos
+        // los ya leídos para no reprocesar respuestas viejas.
+        if (!msg.isUnread()) continue;
         try {
           const resultado = procesarMensaje(msg, processedIds);
           stats[resultado] = (stats[resultado] || 0) + 1;
@@ -158,6 +182,8 @@ function procesarCorreosLaborales() {
 
   } catch (e) {
     logBot('ERROR', 'Fallo general en la corrida', e.message);
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -195,6 +221,10 @@ function procesarMensaje(msg, processedIds) {
     } catch (e) {
       // No crítico. Seguimos.
     }
+    // Registramos el ambiguo para no volver a loguearlo en cada corrida.
+    // Permanece unread/sin archivar — el humano lo gestiona en Gmail.
+    registrarProcesado(messageId, msg, clasificacion);
+    processedIds.add(messageId);
     return 'ambiguo';
   }
 
@@ -351,15 +381,24 @@ function marcarYArchivarSeguro(msg) {
 function getProcessedMessageIds() {
   const sheet = getOrCreateSheet(CONFIG.CONTROL_SHEET_NAME,
     ['MessageID', 'Timestamp', 'From', 'Subject', 'Clasificación', 'Confianza', 'DryRun']);
-  const data = sheet.getDataRange().getValues();
+
+  // Solo leemos las últimas N filas. La query Gmail filtra por newer_than:2d,
+  // así que un buffer de varios días de historial es más que suficiente para
+  // detectar duplicados sin cargar toda la hoja en memoria.
+  const lastRow = sheet.getLastRow();
   const ids = new Set();
+  if (lastRow < 2) return ids;
+
+  const startRow = Math.max(2, lastRow - CONFIG.CONTROL_SHEET_LOOKBACK + 1);
+  const numRows = lastRow - startRow + 1;
+  const data = sheet.getRange(startRow, 1, numRows, 7).getValues();
 
   // CLAVE: separamos los dos universos. En modo prueba solo "vemos" las anotaciones
   // de prueba; en producción solo "vemos" las reales. Así las pruebas no bloquean
   // los reenvíos cuando se active producción, y producción no se confunde con
   // anotaciones de prueba viejas.
   // Columnas: 0=MessageID, 1=Timestamp, 2=From, 3=Subject, 4=Clasificación, 5=Confianza, 6=DryRun
-  for (let i = 1; i < data.length; i++) {
+  for (let i = 0; i < data.length; i++) {
     const id = data[i][0];
     const valDryRun = data[i][6];
     const fueDryRun = valDryRun === true || valDryRun === 'TRUE' || valDryRun === 'true';
