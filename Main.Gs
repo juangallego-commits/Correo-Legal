@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * LEGAL OPS MASTER — Módulo Laboral — V1.1 (MVP Fase 1)
+ * LEGAL OPS MASTER — Módulo Laboral — V1.2 (MVP Fase 1)
  * ============================================================================
  *
  * Reenvía automáticamente correos de procesos laborales desde la bandeja
@@ -12,15 +12,18 @@
  *  - Anti-bucle: tracking de Message-ID en hoja de control
  *  - Marcado seguro: try/catch en etiquetas, marca leído/archiva SIEMPRE
  *  - Cuerpo original preservado: htmlBody = nota + msg.getBody()
- *  - Doble validación por Message-ID antes de procesar
+ *  - Validación por Message-ID antes de procesar
  *
- * CAMBIOS V1.1 (sobre V1.0):
- *  - En DRY_RUN, los correos clasificados como laboral o ambiguo se etiquetan
- *    con BOT/DRY-Laboral o BOT/DRY-Ambiguo. Permite auditar la clasificación
- *    directamente en Gmail sin abrir el sheet.
- *  - La hoja de control BOT_CONTROL_LABORAL ahora separa los universos prueba
- *    y producción. Anotaciones hechas en DRY_RUN no bloquean el reenvío real
- *    cuando se active producción.
+ * CAMBIOS V1.2 (sobre V1.1):
+ *  - Query mode-aware: en DRY excluimos labels DRY, en PROD excluimos labels
+ *    PROD. Un correo clasificado en DRY puede ser reenviado al promover.
+ *  - Sanity checks al inicio: RECIPIENTS no vacío, cuota de envío disponible.
+ *  - En DRY_RUN, alias mal configurado solo emite WARN (no aborta) — facilita
+ *    auditar clasificación sin tener el alias listo todavía.
+ *  - Adjuntos >22MB: no fallan la corrida, se etiquetan ambiguo + log para
+ *    envío manual.
+ *  - Caché de Spreadsheet handle y labels (perf en corridas grandes).
+ *  - Helpers nuevos: limpiarLabelsDRY() y reporteEstado().
  *
  * INSTALACIÓN:
  *  1. Abrir script.google.com CON TU CUENTA PERSONAL (juan.gallego@rappi.com).
@@ -31,9 +34,10 @@
  *  3. Crear nuevo proyecto → pegar este código.
  *  4. Autorizar scopes (Gmail + Sheets) al correr primera vez.
  *  5. Ejecutar testManual() y revisar BOT_LOG_LABORAL en la matriz.
- *  6. Si el log muestra "Alias de envío NO configurado" → arreglar antes de seguir.
+ *  6. Ejecutar reporteEstado() para verificar cuenta/alias/cuota/triggers.
  *  7. Verificar 2-3 días con DRY_RUN=true. Cuando todo se vea bien:
  *     - Cambiar DRY_RUN a false
+ *     - Ejecutar limpiarLabelsDRY() para borrar las etiquetas de prueba
  *     - Ejecutar setupTrigger() una sola vez para instalar el cron de 15 min
  * ============================================================================
  */
@@ -100,13 +104,19 @@ const CONFIG = {
   ],
 
   // --- CONTROL DEL SCAN ---
-  // Excluimos labels propias para que threads ya procesados/marcados no
-  // vuelvan a aparecer en la query (capa extra anti-bucle, además del
-  // tracking por Message-ID).
-  SEARCH_QUERY: 'in:inbox is:unread newer_than:2d ' +
-    '-label:BOT/Laboral-Procesado -label:BOT/Laboral-Revisar ' +
-    '-label:BOT/DRY-Laboral -label:BOT/DRY-Ambiguo',
+  // Base de la query. Las labels a excluir se añaden dinámicamente en
+  // buildSearchQuery() según DRY_RUN, así un correo clasificado en DRY no
+  // queda invisible cuando se hace el switch a producción.
+  SEARCH_QUERY_BASE: 'in:inbox is:unread newer_than:2d',
   MAX_THREADS_PER_RUN: 50,
+
+  // --- LÍMITES DE ENVÍO ---
+  // Gmail rechaza envíos >25MB. Dejamos margen para overhead del cuerpo HTML
+  // y headers. Si un correo excede, lo marcamos ambiguo en vez de fallar.
+  MAX_ATTACHMENT_BYTES: 22 * 1024 * 1024,
+  // Apps Script tiene cuota diaria de envío. Si quedan menos correos que este
+  // umbral, abortamos para no fallar a mitad de corrida.
+  MIN_DAILY_QUOTA: 5,
 
   // Cuántas filas finales leer del control sheet para chequear duplicados.
   // Buffer holgado: 2000 filas cubren semanas de actividad y la query Gmail
@@ -143,17 +153,29 @@ function procesarCorreosLaborales() {
   const startTime = new Date();
   logBot('INFO', 'Inicio de corrida', `DRY_RUN=${CONFIG.DRY_RUN}`);
 
-  // Validación dura: si el alias de envío está configurado pero no existe en
-  // los aliases del usuario, detenemos la corrida. Prefiero que nada salga
-  // a que salga con una identidad incorrecta.
-  if (!validarAliasConfigurado()) {
+  // Sanity checks de configuración antes de tocar Gmail.
+  if (!validarRecipients()) {
+    lock.releaseLock();
+    return;
+  }
+
+  // Alias: en producción es bloqueante (no queremos enviar con identidad
+  // incorrecta). En DRY_RUN solo loguea warning para no estorbar pruebas.
+  if (!validarAliasConfigurado() && !CONFIG.DRY_RUN) {
+    lock.releaseLock();
+    return;
+  }
+
+  // Cuota de envío: solo importa en producción.
+  if (!CONFIG.DRY_RUN && !validarQuotaEnvio()) {
     lock.releaseLock();
     return;
   }
 
   try {
-    const threads = GmailApp.search(CONFIG.SEARCH_QUERY, 0, CONFIG.MAX_THREADS_PER_RUN);
-    logBot('INFO', `Threads encontrados: ${threads.length}`, '');
+    const query = buildSearchQuery();
+    const threads = GmailApp.search(query, 0, CONFIG.MAX_THREADS_PER_RUN);
+    logBot('INFO', `Threads encontrados: ${threads.length}`, `query=${query}`);
 
     const processedIds = getProcessedMessageIds();
 
@@ -241,7 +263,25 @@ function procesarMensaje(msg, processedIds) {
       // No crítico. Seguimos.
     }
   } else {
-    reenviarSeguro(msg, clasificacion);
+    try {
+      reenviarSeguro(msg, clasificacion);
+    } catch (e) {
+      // Adjuntos demasiado pesados: lo desviamos a revisión humana en vez
+      // de fallar la corrida. El humano lo reenvía manualmente.
+      if (e.code === 'ATTACHMENTS_TOO_LARGE') {
+        logBot('AMBIGUO', 'Adjuntos exceden límite, requiere envío manual',
+          `${msg.getFrom()} | ${msg.getSubject()} | ${e.message}`);
+        try {
+          const label = getOrCreateLabel(CONFIG.LABEL_AMBIGUO);
+          msg.getThread().addLabel(label);
+        } catch (_) {}
+        registrarProcesado(messageId, msg,
+          { decision: 'ambiguo', razon: 'attachments_too_large', confianza: 0 });
+        processedIds.add(messageId);
+        return 'ambiguo';
+      }
+      throw e;
+    }
     marcarYArchivarSeguro(msg);
     logBot('OK', 'Reenviado',
       `${msg.getFrom()} | ${msg.getSubject()} | razon=${clasificacion.razon}`);
@@ -327,6 +367,19 @@ function clasificarComoLaboral(msg) {
 function reenviarSeguro(msg, clasificacion) {
   const recipients = CONFIG.RECIPIENTS.join(',');
 
+  // Si los adjuntos exceden el límite de Gmail, no podemos reenviar.
+  // Lanzamos error tipado para que procesarMensaje lo flaggee como ambiguo.
+  const attachments = msg.getAttachments();
+  const totalBytes = attachments.reduce((sum, a) => sum + (a.getBytes().length || 0), 0);
+  if (totalBytes > CONFIG.MAX_ATTACHMENT_BYTES) {
+    const err = new Error(
+      `adjuntos exceden límite (${(totalBytes / 1024 / 1024).toFixed(1)}MB > ` +
+      `${(CONFIG.MAX_ATTACHMENT_BYTES / 1024 / 1024).toFixed(0)}MB)`
+    );
+    err.code = 'ATTACHMENTS_TOO_LARGE';
+    throw err;
+  }
+
   const nota = `
     <div style="background:#f5f5f5; border-left:3px solid #0066cc; padding:10px; margin-bottom:16px; font-family:Arial,sans-serif; font-size:13px; color:#333;">
       <b>Equipo, FYI</b> — reenvío automático de notificación laboral.<br>
@@ -339,7 +392,7 @@ function reenviarSeguro(msg, clasificacion) {
 
   const options = {
     htmlBody: nota + msg.getBody(),
-    attachments: msg.getAttachments()
+    attachments: attachments
   };
 
   // Reenviar CON la identidad del alias configurado (si lo hay),
@@ -435,8 +488,18 @@ function logBot(level, mensaje, detalle) {
   console.log(`[${level}] ${mensaje} | ${detalle}`);
 }
 
+// Cache del handle del Spreadsheet y de las hojas — openById es caro
+// (~200ms) y antes lo llamábamos varias veces por mensaje.
+let _ssCache = null;
+const _sheetCache = {};
+function _getSpreadsheet() {
+  if (!_ssCache) _ssCache = SpreadsheetApp.openById(CONFIG.MATRIX_ID);
+  return _ssCache;
+}
+
 function getOrCreateSheet(name, headers) {
-  const ss = SpreadsheetApp.openById(CONFIG.MATRIX_ID);
+  if (_sheetCache[name]) return _sheetCache[name];
+  const ss = _getSpreadsheet();
   let sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
@@ -446,6 +509,7 @@ function getOrCreateSheet(name, headers) {
       sheet.setFrozenRows(1);
     }
   }
+  _sheetCache[name] = sheet;
   return sheet;
 }
 
@@ -463,10 +527,64 @@ function extractEmail(fromField) {
   return fromField.toLowerCase().trim();
 }
 
+// Cache de labels en memoria por corrida — evita varios getUserLabelByName/run.
+const _labelCache = {};
 function getOrCreateLabel(name) {
+  if (_labelCache[name]) return _labelCache[name];
   let label = GmailApp.getUserLabelByName(name);
   if (!label) label = GmailApp.createLabel(name);
+  _labelCache[name] = label;
   return label;
+}
+
+/**
+ * Construye la query de búsqueda excluyendo SOLO las labels relevantes al modo
+ * actual. En DRY_RUN excluimos labels DRY (para no re-clasificar lo mismo).
+ * En producción excluimos labels de producción (anti-bucle real). Las labels
+ * del otro modo NO se excluyen, así un correo etiquetado en DRY puede ser
+ * reenviado cuando se promueve a producción.
+ */
+function buildSearchQuery() {
+  const exclusiones = CONFIG.DRY_RUN
+    ? [`-label:${CONFIG.LABEL_DRY_LABORAL}`, `-label:${CONFIG.LABEL_DRY_AMBIGUO}`]
+    : [`-label:${CONFIG.LABEL_PROCESADO}`, `-label:${CONFIG.LABEL_AMBIGUO}`];
+  return `${CONFIG.SEARCH_QUERY_BASE} ${exclusiones.join(' ')}`;
+}
+
+/**
+ * Verifica que CONFIG.RECIPIENTS tenga al menos un correo válido.
+ * Sin esto, msg.forward('') falla silenciosamente o devuelve error críptico.
+ */
+function validarRecipients() {
+  const lista = (CONFIG.RECIPIENTS || []).filter(r => r && /@/.test(r));
+  if (lista.length === 0) {
+    logBot('ERROR', 'RECIPIENTS vacío o inválido',
+      `CONFIG.RECIPIENTS = ${JSON.stringify(CONFIG.RECIPIENTS)}. ` +
+      `Agrega al menos un correo válido antes de correr el bot.`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Verifica que la cuota diaria de envío de Apps Script tenga margen.
+ * Mejor abortar al inicio que fallar a mitad de corrida.
+ */
+function validarQuotaEnvio() {
+  try {
+    const remaining = MailApp.getRemainingDailyQuota();
+    if (remaining < CONFIG.MIN_DAILY_QUOTA) {
+      logBot('ERROR', 'Cuota diaria de envío agotada',
+        `restantes=${remaining} < umbral=${CONFIG.MIN_DAILY_QUOTA}. ` +
+        `La cuota se renueva diariamente. Próxima corrida lo intentará de nuevo.`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // Si la API falla, no bloqueamos — la corrida igual intenta enviar.
+    logBot('WARN', 'No pude leer cuota de envío', e.message);
+    return true;
+  }
 }
 
 /**
@@ -486,7 +604,8 @@ function validarAliasConfigurado() {
   if (CONFIG.SEND_AS_ALIAS === cuentaActual) return true;
   if (aliases.includes(CONFIG.SEND_AS_ALIAS)) return true;
 
-  logBot('ERROR', 'Alias de envío NO configurado',
+  const nivel = CONFIG.DRY_RUN ? 'WARN' : 'ERROR';
+  logBot(nivel, 'Alias de envío NO configurado',
     `SEND_AS_ALIAS=${CONFIG.SEND_AS_ALIAS} no está disponible en la cuenta ${cuentaActual}. ` +
     `Aliases disponibles: [${aliases.join(', ') || 'ninguno'}]. ` +
     `Configúralo en Gmail → Settings → Accounts and Import → "Send mail as".`);
@@ -535,4 +654,51 @@ function apagarBot() {
     }
   }
   logBot('INFO', 'Bot apagado', 'Todos los triggers fueron eliminados');
+}
+
+/**
+ * Borra las labels DRY (BOT/DRY-Laboral, BOT/DRY-Ambiguo) de Gmail.
+ * Ejecutar UNA vez al promover el bot a producción, después de cambiar
+ * DRY_RUN a false. Al borrar la label, Gmail la quita de todos los correos
+ * automáticamente, así los correos clasificados durante la prueba pueden
+ * ser reenviados de verdad si todavía están dentro de la ventana de 48h.
+ */
+function limpiarLabelsDRY() {
+  const nombres = [CONFIG.LABEL_DRY_LABORAL, CONFIG.LABEL_DRY_AMBIGUO];
+  let borradas = 0;
+  for (const nombre of nombres) {
+    const label = GmailApp.getUserLabelByName(nombre);
+    if (label) {
+      label.deleteLabel();
+      borradas++;
+    }
+  }
+  logBot('INFO', 'Labels DRY limpiadas',
+    `${borradas} label(s) borrada(s) de [${nombres.join(', ')}]`);
+}
+
+/**
+ * Imprime un resumen rápido del estado del bot en consola y en el log:
+ * última corrida, cuota de envío restante, alias configurado, threads
+ * pendientes según la query. Útil para auditar antes/después de promover.
+ */
+function reporteEstado() {
+  const cuenta = Session.getActiveUser().getEmail();
+  const aliases = GmailApp.getAliases();
+  let quota = 'N/A';
+  try { quota = MailApp.getRemainingDailyQuota(); } catch (_) {}
+  const query = buildSearchQuery();
+  const pendientes = GmailApp.search(query, 0, 1).length > 0
+    ? `>=1 (sample con tope 1)`
+    : '0';
+  const triggers = ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'procesarCorreosLaborales').length;
+
+  const resumen =
+    `cuenta=${cuenta} | DRY_RUN=${CONFIG.DRY_RUN} | triggers=${triggers} | ` +
+    `quota=${quota} | alias=${CONFIG.SEND_AS_ALIAS || '(ninguno)'} | ` +
+    `aliases_disponibles=[${aliases.join(', ') || 'ninguno'}] | ` +
+    `pendientes=${pendientes} | query="${query}"`;
+  console.log(resumen);
+  logBot('INFO', 'Reporte de estado', resumen);
 }
