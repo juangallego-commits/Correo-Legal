@@ -1,0 +1,4 @@
+# clasp solo debe subir el archivo Apps Script. Todo lo demás se ignora.
+**/**
+!Main.Gs
+!appsscript.json
