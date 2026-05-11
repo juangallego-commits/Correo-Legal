@@ -1,11 +1,12 @@
 /**
  * ============================================================================
- * LEGAL OPS MASTER — Módulo Laboral — V1.1 (MVP Fase 1)
+ * LEGAL OPS MASTER — Módulo Laboral — V1.2 (MVP Fase 1 + extracción)
  * ============================================================================
  *
  * Reenvía automáticamente correos de procesos laborales desde la bandeja
  * notificacionesrappi@rappi.com hacia Godoy (firma externa) + equipo legal
- * interno.
+ * interno. Adicionalmente, lee el PDF del auto admisorio y carga los datos
+ * del proceso en un Spreadsheet aparte (Procesos Laborales).
  *
  * APLICA TODAS LAS LECCIONES DE V16.0 SAFE MODE:
  *  - Filtro de tiempo: solo correos de las últimas 48h (newer_than:2d)
@@ -13,6 +14,19 @@
  *  - Marcado seguro: try/catch en etiquetas, marca leído/archiva SIEMPRE
  *  - Cuerpo original preservado: htmlBody = nota + msg.getBody()
  *  - Doble validación por Message-ID antes de procesar
+ *
+ * CAMBIOS V1.2 (sobre V1.1):
+ *  - Nuevo módulo de extracción de procesos: para cada correo laboral, el bot
+ *    intenta leer el PDF adjunto (OCR vía Drive API v2), extraer los campos
+ *    con regex y, si faltan campos críticos, completar con Gemini API. Carga
+ *    los datos en un Spreadsheet aparte con la misma estructura de 29 columnas
+ *    que "Procesos Laborales Repartidores".
+ *  - Upsert seguro: si el radicado ya existe, solo rellena celdas vacías —
+ *    nunca pisa ediciones manuales de Nicolas/Isabela.
+ *  - En DRY_RUN escribe en pestaña aparte (BOT_DRY_Procesos) del mismo Spreadsheet
+ *    para validar la calidad de extracción sin contaminar producción.
+ *  - La extracción es best-effort: cualquier fallo se loguea pero no bloquea
+ *    el reenvío al equipo legal, que es la función crítica del bot.
  *
  * CAMBIOS V1.1 (sobre V1.0):
  *  - En DRY_RUN, los correos clasificados como laboral o ambiguo se etiquetan
@@ -35,6 +49,17 @@
  *  7. Verificar 2-3 días con DRY_RUN=true. Cuando todo se vea bien:
  *     - Cambiar DRY_RUN a false
  *     - Ejecutar setupTrigger() una sola vez para instalar el cron de 15 min
+ *
+ * SETUP ADICIONAL PARA EL MÓDULO DE EXTRACCIÓN (V1.2):
+ *  8. Crear un Spreadsheet nuevo (vacío). Anotar su ID y pegarlo en
+ *     CONFIG.PROCESOS.SPREADSHEET_ID. El bot creará las pestañas necesarias.
+ *  9. Generar API key en Google AI Studio (https://aistudio.google.com) y
+ *     pegarla como Script Property: Project Settings → Script Properties →
+ *     Add → name: GEMINI_API_KEY.
+ * 10. Habilitar Drive API v2 como advanced service: Services → Add →
+ *     Drive API → seleccionar v2 → Add.
+ * 11. Verificar con testExtraccionMensaje(messageId) sobre un correo laboral
+ *     real antes de activar producción.
  * ============================================================================
  */
 
@@ -123,6 +148,71 @@ const CONFIG = {
   // (se quitan de todos los correos automáticamente).
   LABEL_DRY_LABORAL: 'BOT/DRY-Laboral',
   LABEL_DRY_AMBIGUO: 'BOT/DRY-Ambiguo',
+
+  // --- EXTRACCIÓN DE PROCESOS A SHEET NUEVO ---
+  // Cuando un correo se clasifica como laboral, además de reenviarlo se intenta
+  // leer el PDF del auto admisorio, extraer los campos del proceso (radicado,
+  // juzgado, demandante, etc.) y cargarlos en un Spreadsheet aparte que imita
+  // la estructura de "Procesos Laborales Repartidores".
+  //
+  // SETUP MANUAL (one-time):
+  //  1. Crear un Spreadsheet nuevo (no la matriz). Anotar su ID y pegarlo en
+  //     PROCESOS.SPREADSHEET_ID. El bot creará las pestañas necesarias.
+  //  2. En Google AI Studio (https://aistudio.google.com) generar una API key
+  //     de Gemini y pegarla como Script Property:
+  //     Project Settings → Script Properties → Add → name: GEMINI_API_KEY.
+  //  3. Habilitar Drive API v2 como advanced service:
+  //     Services → Add → Drive API → versión v2.
+  PROCESOS: {
+    SPREADSHEET_ID: '',                       // ← rellenar a mano tras crear el archivo
+    SHEET_NAME: 'Procesos Laborales',
+    SHEET_NAME_DRY: 'BOT_DRY_Procesos',
+    PENDIENTES_SHEET_NAME: 'BOT_EXTRACCION_PENDIENTE',
+    EXTRAER: true,                            // master switch del módulo
+    USAR_GEMINI_FALLBACK: true,
+    GEMINI_MODEL: 'gemini-2.0-flash',
+    GEMINI_ENDPOINT: 'https://generativelanguage.googleapis.com/v1beta/models/',
+    GEMINI_TIMEOUT_MS: 20000,
+    GEMINI_MAX_RETRIES: 1,
+    PDF_MAX_BYTES: 15 * 1024 * 1024,          // 15 MB cap por adjunto
+    CAMPOS_CRITICOS: ['radicado', 'juzgado', 'demandante'],
+    TEXTO_OCR_MAX_CHARS: 15000,               // truncar antes de Gemini
+
+    // Headers exactos del sheet original "Procesos Laborales Repartidores".
+    // 29 columnas A..AC. NO cambiar el orden — upsertProcesoEnSheet asume
+    // este orden para mapear los campos extraídos a celdas.
+    HEADERS: [
+      ' ',                                          // A
+      'Link carpeta',                               // B
+      'Número de Radicado',                         // C
+      'Tipo de acción',                             // D
+      'Juzgado',                                    // E
+      'Tendencia del Juzgado',                      // F
+      'Ciudad',                                     // G
+      'Demandante',                                 // H
+      'ID Soy Rappi',                               // I
+      'Es Rayo actualmente?',                       // J
+      '¿Ha sido Rayo?',                             // K
+      'Responsable ED/CD',                          // L
+      'Estado Actual',                              // M
+      'Fecha notificación del auto admisorio de la demanda',  // N
+      'Fecha de audiencia',                         // O
+      'Hora y articulos de la audiencia ',          // P
+      'Fecha conciliación',                         // Q
+      'Valor Conciliación',                         // R
+      'Valor Pretensión',                           // S
+      'Fecha de otorgación del poder',              // T
+      'Honorarios Godoy',                           // U
+      'Pendiente Facturación Godoy',                // V
+      'Tipo de caso',                               // W
+      'Ganancias totales',                          // X
+      'Última actuación',                           // Y
+      'Resumen del caso ',                          // Z
+      'Mes radicado',                               // AA
+      'Mes conciliado',                             // AB
+      'Diff radicado y conciliado'                  // AC
+    ],
+  },
 };
 
 
@@ -149,6 +239,13 @@ function procesarCorreosLaborales() {
   if (!validarAliasConfigurado()) {
     lock.releaseLock();
     return;
+  }
+
+  // Validación suave: si el módulo de extracción está activo, avisar (no
+  // bloquear) sobre configuración faltante. El forward sigue funcionando aun
+  // si la extracción no puede correr.
+  if (CONFIG.PROCESOS.EXTRAER) {
+    validarExtraccionConfigurada();
   }
 
   try {
@@ -245,6 +342,18 @@ function procesarMensaje(msg, processedIds) {
     marcarYArchivarSeguro(msg);
     logBot('OK', 'Reenviado',
       `${msg.getFrom()} | ${msg.getSubject()} | razon=${clasificacion.razon}`);
+  }
+
+  // Enriquecimiento best-effort: leer el PDF del auto admisorio y cargar el
+  // proceso en el sheet aparte. NUNCA debe bloquear el flujo del reenvío:
+  // si esto falla, el correo ya quedó reenviado/etiquetado correctamente.
+  if (CONFIG.PROCESOS.EXTRAER) {
+    try {
+      extraerYUpsertProceso(msg, clasificacion);
+    } catch (e) {
+      logBot('WARN', 'Extracción de proceso falló (no bloquea forward)',
+        `${messageId} → ${e.message}`);
+    }
   }
 
   registrarProcesado(messageId, msg, clasificacion);
@@ -435,8 +544,8 @@ function logBot(level, mensaje, detalle) {
   console.log(`[${level}] ${mensaje} | ${detalle}`);
 }
 
-function getOrCreateSheet(name, headers) {
-  const ss = SpreadsheetApp.openById(CONFIG.MATRIX_ID);
+function getOrCreateSheet(name, headers, spreadsheetId) {
+  const ss = SpreadsheetApp.openById(spreadsheetId || CONFIG.MATRIX_ID);
   let sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
@@ -491,6 +600,539 @@ function validarAliasConfigurado() {
     `Aliases disponibles: [${aliases.join(', ') || 'ninguno'}]. ` +
     `Configúralo en Gmail → Settings → Accounts and Import → "Send mail as".`);
   return false;
+}
+
+
+// ============================================================================
+// EXTRACCIÓN DE PROCESOS LABORALES → SHEET DE PROCESOS
+// ============================================================================
+//
+// Cuando un correo se clasifica como laboral, además de reenviarlo se intenta
+// leer el PDF del auto admisorio y cargar los datos del proceso (radicado,
+// juzgado, demandante, ciudad, fecha de notificación, tipo de caso) en un
+// Spreadsheet aparte que imita la estructura de "Procesos Laborales Repartidores".
+//
+// Pipeline:
+//   obtenerPdfAdjunto → extraerTextoPdf (Drive OCR) → extraerCamposRegex →
+//   [si faltan críticos] extraerCamposGemini → consolidarCampos → upsertProcesoEnSheet
+//
+// Todo el módulo es best-effort: cualquier fallo se loguea pero no afecta
+// al reenvío, que ya ocurrió antes en procesarMensaje.
+
+function extraerYUpsertProceso(msg, clasificacion) {
+  const messageId = msg.getId();
+  const sheetCfg = CONFIG.PROCESOS;
+
+  // Sin spreadsheet destino configurado no podemos hacer nada útil.
+  if (!sheetCfg.SPREADSHEET_ID) {
+    logBot('WARN', 'Extracción saltada: PROCESOS.SPREADSHEET_ID vacío', messageId);
+    return { ok: false, accion: 'skip', razon: 'sheet_no_configurado' };
+  }
+
+  const pdfBlob = obtenerPdfAdjunto(msg);
+  if (!pdfBlob) {
+    logBot('INFO', 'Extracción: correo sin PDF adjunto', messageId);
+    return { ok: false, accion: 'skip', razon: 'sin_pdf' };
+  }
+
+  let texto = '';
+  try {
+    const r = extraerTextoPdf(pdfBlob);
+    texto = r.texto || '';
+  } catch (e) {
+    logBot('WARN', 'OCR del PDF falló', `${messageId} → ${e.message}`);
+    registrarPendiente(messageId, '', 'ocr_fallido');
+    return { ok: false, accion: 'skip', razon: 'ocr_fallido' };
+  }
+
+  if (!texto || texto.length < 50) {
+    logBot('WARN', 'OCR devolvió texto vacío o muy corto', `${messageId} chars=${texto.length}`);
+    registrarPendiente(messageId, '', 'ocr_vacio');
+    return { ok: false, accion: 'skip', razon: 'ocr_vacio' };
+  }
+
+  // Regex first
+  const camposRegex = extraerCamposRegex(texto);
+
+  // Gemini fallback solo si faltan críticos y está habilitado
+  let camposGemini = null;
+  const faltanCriticos = sheetCfg.CAMPOS_CRITICOS.some(c => !camposRegex[c]);
+  if (faltanCriticos && sheetCfg.USAR_GEMINI_FALLBACK) {
+    camposGemini = extraerCamposGemini(texto, camposRegex);
+  }
+
+  const consolidado = consolidarCampos(camposRegex, camposGemini, msg);
+
+  if (!consolidado.radicado) {
+    logBot('WARN', 'No se pudo extraer radicado', `${messageId} | from=${extractEmail(msg.getFrom())}`);
+    registrarPendiente(messageId, '', 'sin_radicado');
+    return { ok: false, accion: 'skip', razon: 'sin_radicado' };
+  }
+
+  const resultado = upsertProcesoEnSheet(consolidado);
+  logBot('OK', `Proceso ${resultado.accion}`,
+    `${messageId} | radicado=${consolidado.radicado} | fila=${resultado.fila} | celdas=${resultado.celdasActualizadas || 0}`);
+
+  return { ok: true, accion: resultado.accion, radicado: consolidado.radicado };
+}
+
+function obtenerPdfAdjunto(msg) {
+  const adjuntos = msg.getAttachments({ includeInlineImages: false, includeAttachments: true });
+  const pdfs = adjuntos.filter(a => {
+    const nombre = (a.getName() || '').toLowerCase();
+    const mime = a.getContentType();
+    return mime === 'application/pdf' || nombre.endsWith('.pdf');
+  });
+
+  if (pdfs.length === 0) return null;
+
+  if (pdfs.length > 1) {
+    const nombres = pdfs.map(p => p.getName()).join(', ');
+    logBot('WARN', `Múltiples PDFs adjuntos (${pdfs.length}) — tomando el más grande`, nombres);
+  }
+
+  // Tomar el PDF más grande (típicamente el auto admisorio vs anexos pequeños).
+  pdfs.sort((a, b) => b.getBytes().length - a.getBytes().length);
+  const elegido = pdfs[0];
+
+  if (elegido.getBytes().length > CONFIG.PROCESOS.PDF_MAX_BYTES) {
+    logBot('WARN', 'PDF excede límite de tamaño',
+      `${elegido.getName()} bytes=${elegido.getBytes().length}`);
+    return null;
+  }
+  return elegido;
+}
+
+/**
+ * Convierte un blob de PDF a texto usando Drive API v2 con OCR.
+ * Requiere que Drive API v2 esté habilitada como advanced service.
+ * Crea un Google Doc temporal, extrae el texto, y lo borra en finally.
+ */
+function extraerTextoPdf(blob) {
+  if (typeof Drive === 'undefined') {
+    throw new Error('Drive API v2 advanced service no habilitado');
+  }
+  let fileId = null;
+  try {
+    const file = Drive.Files.insert(
+      {
+        title: 'tmp_ocr_' + Date.now(),
+        mimeType: 'application/vnd.google-apps.document'
+      },
+      blob,
+      { ocr: true, ocrLanguage: 'es' }
+    );
+    fileId = file.id;
+    const doc = DocumentApp.openById(fileId);
+    const texto = doc.getBody().getText() || '';
+    return { texto: texto, metodo: 'drive_ocr', paginas: 0 };
+  } finally {
+    if (fileId) {
+      try { Drive.Files.remove(fileId); } catch (e) {
+        logBot('WARN', 'No se pudo borrar archivo temporal de OCR', `${fileId} → ${e.message}`);
+      }
+    }
+  }
+}
+
+function extraerCamposRegex(texto) {
+  const t = (texto || '').replace(/\s+/g, ' ');
+  const tLower = t.toLowerCase();
+
+  const out = {
+    radicado: null,
+    juzgado: null,
+    demandante: null,
+    ciudad: null,
+    fechaNotificacion: null,  // Date|null
+    tipoCaso: null,
+    _faltantes: [],
+  };
+
+  // --- Radicado: 23 dígitos con o sin separadores ---
+  // Formato estándar colombiano: 11001310502120240012300 (puede venir con guiones/espacios)
+  const reRadicado23 = /\b(\d{5}\s*[-\s]?\s*\d{2}\s*[-\s]?\s*\d{2}\s*[-\s]?\s*\d{3}\s*[-\s]?\s*\d{4}\s*[-\s]?\s*\d{5}\s*[-\s]?\s*\d{2})\b/;
+  let m = t.match(reRadicado23);
+  if (m) out.radicado = normalizarRadicado(m[1]);
+  if (!out.radicado) {
+    // Buscar como secuencia "limpia" de exactamente 23 dígitos
+    const m2 = t.replace(/[-\s]/g, '').match(/\b(\d{23})\b/);
+    if (m2) out.radicado = m2[1];
+  }
+
+  // --- Juzgado ---
+  const reJuzgado = /juzgado\s+([a-záéíóúñ0-9°º\s]+?(?:laboral(?:es)?\s+del\s+circuito|laboral|municipal\s+de\s+pequeñas\s+causas\s+laborales)[^.\n\r]{0,120})/i;
+  m = t.match(reJuzgado);
+  if (m) {
+    out.juzgado = ('Juzgado ' + m[1]).replace(/\s+/g, ' ').trim();
+    // Ciudad heurística desde el juzgado: "...de Bogotá D.C." / "...de Medellín"
+    const ciudadFromJuz = out.juzgado.match(/\bde\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ\.\s]+?)(?:\s*[-,]|\s*$)/);
+    if (ciudadFromJuz) out.ciudad = ciudadFromJuz[1].trim().replace(/\s+/g, ' ');
+  }
+
+  // --- Demandante ---
+  // Trabajamos sobre el texto original (con mayúsculas) para preservar nombres propios.
+  const reDemandante = /(?:parte\s+)?demandante[s]?\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ' ]{3,100}?)(?=\s*(?:demandado|c\.?c\.?\b|cédula|nit\b|\.|$|,\s*identificad))/;
+  m = t.match(reDemandante);
+  if (m) out.demandante = m[1].trim().replace(/\s+/g, ' ');
+
+  // --- Fecha de notificación ---
+  const meses = {
+    'enero': 0, 'febrero': 1, 'marzo': 2, 'abril': 3, 'mayo': 4, 'junio': 5,
+    'julio': 6, 'agosto': 7, 'septiembre': 8, 'setiembre': 8, 'octubre': 9,
+    'noviembre': 10, 'diciembre': 11
+  };
+  const reFecha = /(\d{1,2})\s+de\s+([a-záéíóú]+)\s+de\s+(20\d{2})/i;
+  m = tLower.match(reFecha);
+  if (m) {
+    const dia = parseInt(m[1], 10);
+    const mes = meses[m[2].toLowerCase()];
+    const anio = parseInt(m[3], 10);
+    if (mes !== undefined && dia >= 1 && dia <= 31) {
+      out.fechaNotificacion = new Date(anio, mes, dia);
+    }
+  }
+
+  // --- Tipo de caso ---
+  if (/(?:contrato\s+realidad|primac[ií]a\s+de\s+la\s+realidad|declaraci[oó]n\s+de\s+(?:la\s+)?existencia\s+(?:del\s+)?contrato)/i.test(t)) {
+    out.tipoCaso = 'Declaración Contrato Realidad';
+  }
+
+  // Diagnóstico de faltantes
+  ['radicado', 'juzgado', 'demandante', 'ciudad', 'fechaNotificacion', 'tipoCaso'].forEach(k => {
+    if (!out[k]) out._faltantes.push(k);
+  });
+
+  return out;
+}
+
+function extraerCamposGemini(texto, camposParciales) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) {
+    logBot('WARN', 'Gemini fallback omitido: GEMINI_API_KEY no configurada', '');
+    return null;
+  }
+
+  const cfg = CONFIG.PROCESOS;
+  const textoTrunc = (texto || '').slice(0, cfg.TEXTO_OCR_MAX_CHARS);
+
+  const systemPrompt =
+    'Eres un asistente que extrae datos estructurados de autos admisorios de demanda laboral en Colombia. ' +
+    'Recibes el texto OCR de un PDF judicial. Responde EXCLUSIVAMENTE con JSON válido, sin texto adicional, ' +
+    'sin markdown. Si un campo no aparece claramente en el texto, su valor debe ser null. No inventes datos.';
+
+  const userPrompt =
+    'Texto del auto admisorio:\n"""\n' + textoTrunc + '\n"""\n\n' +
+    'Campos ya detectados por regex (pueden ser null o estar incompletos):\n' +
+    JSON.stringify({
+      radicado: camposParciales.radicado,
+      juzgado: camposParciales.juzgado,
+      demandante: camposParciales.demandante,
+      ciudad: camposParciales.ciudad,
+      fechaNotificacion: camposParciales.fechaNotificacion
+        ? Utilities.formatDate(camposParciales.fechaNotificacion, 'UTC', 'yyyy-MM-dd')
+        : null,
+      tipoCaso: camposParciales.tipoCaso,
+    }) +
+    '\n\nDevuelve un JSON con esta forma exacta:\n' +
+    '{\n' +
+    '  "radicado": string|null,\n' +
+    '  "juzgado": string|null,\n' +
+    '  "demandante": string|null,\n' +
+    '  "ciudad": string|null,\n' +
+    '  "fechaNotificacion": string|null,\n' +
+    '  "tipoCaso": string|null\n' +
+    '}';
+
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      maxOutputTokens: 512,
+    },
+  };
+
+  const url = cfg.GEMINI_ENDPOINT + cfg.GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(apiKey);
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  };
+
+  const maxAttempts = 1 + (cfg.GEMINI_MAX_RETRIES || 0);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = UrlFetchApp.fetch(url, options);
+      const code = resp.getResponseCode();
+      if (code >= 200 && code < 300) {
+        const parsed = JSON.parse(resp.getContentText());
+        const text = (((parsed.candidates || [])[0] || {}).content || {}).parts || [];
+        const raw = text.map(p => p.text || '').join('').trim();
+        if (!raw) {
+          logBot('WARN', 'Gemini devolvió respuesta vacía', '');
+          return null;
+        }
+        try {
+          const data = JSON.parse(raw);
+          return {
+            radicado: data.radicado ? normalizarRadicado(data.radicado) : null,
+            juzgado: data.juzgado || null,
+            demandante: data.demandante || null,
+            ciudad: data.ciudad || null,
+            fechaNotificacion: data.fechaNotificacion ? parseFechaIso(data.fechaNotificacion) : null,
+            tipoCaso: data.tipoCaso || null,
+          };
+        } catch (e) {
+          logBot('WARN', 'Gemini devolvió JSON inválido', raw.slice(0, 200));
+          return null;
+        }
+      }
+      logBot('WARN', `Gemini HTTP ${code} (intento ${attempt}/${maxAttempts})`,
+        resp.getContentText().slice(0, 300));
+    } catch (e) {
+      logBot('WARN', `Gemini fetch falló (intento ${attempt}/${maxAttempts})`, e.message);
+    }
+    if (attempt < maxAttempts) Utilities.sleep(2000);
+  }
+  return null;
+}
+
+function parseFechaIso(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+}
+
+/**
+ * Combina los campos extraídos por regex y Gemini, añade derivados,
+ * y devuelve un array de 29 valores en el orden de CONFIG.PROCESOS.HEADERS.
+ * Regex gana donde tiene valor; Gemini rellena nulls.
+ */
+function consolidarCampos(regex, gemini, msg) {
+  const merge = (a, b) => (a != null && a !== '') ? a : (b != null && b !== '' ? b : null);
+
+  const radicado = merge(regex.radicado, gemini && gemini.radicado);
+  const juzgado = merge(regex.juzgado, gemini && gemini.juzgado);
+  const demandante = merge(regex.demandante, gemini && gemini.demandante);
+  const ciudad = merge(regex.ciudad, gemini && gemini.ciudad);
+  const fechaNot = merge(regex.fechaNotificacion, gemini && gemini.fechaNotificacion) || msg.getDate();
+  const tipoCaso = merge(regex.tipoCaso, gemini && gemini.tipoCaso) || 'Declaración Contrato Realidad';
+
+  const mesRadicado = fechaNot
+    ? Utilities.formatDate(fechaNot, Session.getScriptTimeZone(), 'yyyy-MM')
+    : '';
+
+  // Fila en orden A..AC (29 columnas). Las columnas que no podemos llenar
+  // automáticamente quedan en '' para que el upsert respete celdas vacías.
+  return {
+    radicado: radicado,
+    fila: [
+      '',                                          // A
+      '',                                          // B Link carpeta
+      radicado || '',                              // C Número de Radicado
+      'Laboral',                                   // D Tipo de acción
+      juzgado || '',                               // E Juzgado
+      '',                                          // F Tendencia
+      ciudad || '',                                // G Ciudad
+      demandante || '',                            // H Demandante
+      '',                                          // I ID Soy Rappi
+      '',                                          // J Es Rayo actualmente?
+      '',                                          // K ¿Ha sido Rayo?
+      '',                                          // L Responsable ED/CD
+      'Notificación del auto admisorio de la demanda',  // M Estado Actual
+      fechaNot || '',                              // N Fecha notificación auto admisorio
+      '',                                          // O Fecha audiencia
+      '',                                          // P Hora y articulos
+      '',                                          // Q Fecha conciliación
+      '',                                          // R Valor Conciliación
+      '',                                          // S Valor Pretensión
+      '',                                          // T Fecha otorgación poder
+      '',                                          // U Honorarios Godoy
+      '',                                          // V Pendiente Facturación Godoy
+      tipoCaso || '',                              // W Tipo de caso
+      '',                                          // X Ganancias totales
+      'Notificación auto admisorio',               // Y Última actuación
+      '',                                          // Z Resumen del caso
+      mesRadicado,                                 // AA Mes radicado
+      '',                                          // AB Mes conciliado
+      '',                                          // AC Diff
+    ],
+  };
+}
+
+function upsertProcesoEnSheet(consolidado) {
+  const sheet = getProcesosSheet();
+  const radicadoNorm = normalizarRadicado(consolidado.radicado);
+  const nuevasValues = consolidado.fila;
+
+  // Buscar radicado existente en columna C (índice 3). Probamos varias formas
+  // porque el sheet puede tener el radicado con guiones, espacios o limpio.
+  const lastRow = sheet.getLastRow();
+  let filaExistente = null;
+  if (lastRow >= 2) {
+    const rangoC = sheet.getRange(2, 3, lastRow - 1, 1).getValues();
+    for (let i = 0; i < rangoC.length; i++) {
+      const val = rangoC[i][0];
+      if (val && normalizarRadicado(val.toString()) === radicadoNorm) {
+        filaExistente = i + 2;
+        break;
+      }
+    }
+  }
+
+  if (filaExistente === null) {
+    sheet.appendRow(nuevasValues);
+    return { accion: 'insert', fila: sheet.getLastRow(), celdasActualizadas: 29 };
+  }
+
+  // Update: solo escribir celdas vacías.
+  const numCols = nuevasValues.length;
+  const actuales = sheet.getRange(filaExistente, 1, 1, numCols).getValues()[0];
+  let cambios = 0;
+  const colsActualizadas = [];
+  for (let col = 0; col < numCols; col++) {
+    const vacioActual = actuales[col] === '' || actuales[col] === null;
+    const nuevoTieneValor = nuevasValues[col] !== '' && nuevasValues[col] !== null;
+    if (vacioActual && nuevoTieneValor) {
+      actuales[col] = nuevasValues[col];
+      cambios++;
+      colsActualizadas.push(colNumToLetter(col + 1));
+    }
+  }
+  if (cambios > 0) {
+    sheet.getRange(filaExistente, 1, 1, numCols).setValues([actuales]);
+    return { accion: 'update', fila: filaExistente, celdasActualizadas: cambios, columnas: colsActualizadas };
+  }
+  return { accion: 'skip', fila: filaExistente, celdasActualizadas: 0 };
+}
+
+function getProcesosSheet() {
+  const cfg = CONFIG.PROCESOS;
+  const nombre = CONFIG.DRY_RUN ? cfg.SHEET_NAME_DRY : cfg.SHEET_NAME;
+  return getOrCreateSheet(nombre, cfg.HEADERS, cfg.SPREADSHEET_ID);
+}
+
+function normalizarRadicado(raw) {
+  if (!raw) return '';
+  return raw.toString().replace(/[\s\-_]/g, '').trim();
+}
+
+function colNumToLetter(n) {
+  let s = '';
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function registrarPendiente(messageId, radicadoParcial, razon) {
+  try {
+    const sheet = getOrCreateSheet(
+      CONFIG.PROCESOS.PENDIENTES_SHEET_NAME,
+      ['Timestamp', 'MessageID', 'Radicado_parcial', 'Razon', 'Reintentos', 'DryRun'],
+      CONFIG.PROCESOS.SPREADSHEET_ID
+    );
+    sheet.appendRow([new Date(), messageId, radicadoParcial || '', razon, 0, CONFIG.DRY_RUN]);
+  } catch (e) {
+    logBot('WARN', 'No se pudo registrar pendiente de extracción', `${messageId} → ${e.message}`);
+  }
+}
+
+/**
+ * Verifica que el módulo de extracción tenga la configuración mínima:
+ *  - SPREADSHEET_ID seteado
+ *  - GEMINI_API_KEY en Script Properties (si USAR_GEMINI_FALLBACK=true)
+ *  - Drive advanced service habilitado
+ * NUNCA bloquea la corrida; solo loguea warnings.
+ */
+function validarExtraccionConfigurada() {
+  const cfg = CONFIG.PROCESOS;
+  if (!cfg.SPREADSHEET_ID) {
+    logBot('WARN', 'PROCESOS.SPREADSHEET_ID vacío — extracción no podrá escribir',
+      'Crear un Spreadsheet nuevo y pegar su ID en CONFIG.PROCESOS.SPREADSHEET_ID');
+  }
+  if (cfg.USAR_GEMINI_FALLBACK) {
+    const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+    if (!key) {
+      logBot('WARN', 'GEMINI_API_KEY no configurada en Script Properties',
+        'Solo regex correrá. Setear en Project Settings → Script Properties.');
+    }
+  }
+  if (typeof Drive === 'undefined') {
+    logBot('WARN', 'Drive API v2 advanced service no habilitado',
+      'Habilitar en Services del editor de Apps Script para que funcione el OCR.');
+  }
+}
+
+/**
+ * Utilidad manual: corre la extracción aislada sobre un correo específico.
+ * Útil para depurar regex/Gemini sin esperar al cron.
+ *
+ * Uso desde el editor de Apps Script:
+ *   1. Ejecutar testExtraccionMensaje con un messageId real.
+ *   2. Revisar la pestaña destino y BOT_LOG_LABORAL.
+ */
+function testExtraccionMensaje(messageId) {
+  if (!messageId) {
+    throw new Error('Pasa un messageId. Cómo obtenerlo: abre un correo en Gmail y mira la URL.');
+  }
+  const msg = GmailApp.getMessageById(messageId);
+  if (!msg) throw new Error('Mensaje no encontrado: ' + messageId);
+  const clasif = clasificarComoLaboral(msg);
+  logBot('INFO', 'testExtraccion: clasificación', JSON.stringify(clasif));
+  const r = extraerYUpsertProceso(msg, clasif);
+  logBot('INFO', 'testExtraccion: resultado', JSON.stringify(r));
+  return r;
+}
+
+/**
+ * Utilidad manual: reintenta extracción para correos que cayeron en la pestaña
+ * BOT_EXTRACCION_PENDIENTE por causa recuperable (OCR timeout, Gemini caído).
+ */
+function reprocesarExtraccionPendiente() {
+  const cfg = CONFIG.PROCESOS;
+  if (!cfg.SPREADSHEET_ID) {
+    logBot('ERROR', 'reprocesarExtraccionPendiente: SPREADSHEET_ID vacío', '');
+    return;
+  }
+  const sheet = getOrCreateSheet(
+    cfg.PENDIENTES_SHEET_NAME,
+    ['Timestamp', 'MessageID', 'Radicado_parcial', 'Razon', 'Reintentos', 'DryRun'],
+    cfg.SPREADSHEET_ID
+  );
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    logBot('INFO', 'reprocesarExtraccionPendiente: nada pendiente', '');
+    return;
+  }
+  const data = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
+  let exitos = 0, fallos = 0;
+  for (let i = 0; i < data.length; i++) {
+    const messageId = data[i][1];
+    const fueDryRun = data[i][5] === true || data[i][5] === 'TRUE' || data[i][5] === 'true';
+    if (!messageId || fueDryRun !== CONFIG.DRY_RUN) continue;
+    try {
+      const msg = GmailApp.getMessageById(messageId);
+      if (!msg) { fallos++; continue; }
+      const clasif = clasificarComoLaboral(msg);
+      const r = extraerYUpsertProceso(msg, clasif);
+      if (r.ok) {
+        exitos++;
+        sheet.getRange(i + 2, 5).setValue((data[i][4] || 0) + 1);
+      } else {
+        fallos++;
+      }
+    } catch (e) {
+      fallos++;
+      logBot('WARN', 'reprocesarExtraccionPendiente: fallo en mensaje', `${messageId} → ${e.message}`);
+    }
+  }
+  logBot('INFO', 'reprocesarExtraccionPendiente terminado', `exitos=${exitos} fallos=${fallos}`);
 }
 
 
