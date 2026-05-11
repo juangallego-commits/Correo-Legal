@@ -164,7 +164,7 @@ const CONFIG = {
   //  3. Habilitar Drive API v2 como advanced service:
   //     Services → Add → Drive API → versión v2.
   PROCESOS: {
-    SPREADSHEET_ID: '',                       // ← rellenar a mano tras crear el archivo
+    SPREADSHEET_ID: '1isRib51rcK6iLtU5ppJTD7cayjwcFTe7SSxRboMVKIM',
     SHEET_NAME: 'Procesos Laborales',
     SHEET_NAME_DRY: 'BOT_DRY_Procesos',
     PENDIENTES_SHEET_NAME: 'BOT_EXTRACCION_PENDIENTE',
